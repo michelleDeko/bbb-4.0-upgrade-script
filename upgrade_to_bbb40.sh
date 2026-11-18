@@ -11,7 +11,9 @@
 #   removal of the BBB 3.0 packages, removal of the jammy-only apt sources,
 #   do-release-upgrade. The package removal keeps /etc/bigbluebutton
 #   (overrides, apply-config.sh, livekit*.yaml), /var/bigbluebutton
-#   (recordings) and Greenlight.
+#   (recordings) and Greenlight. It deletes the directory of the HTML5 client:
+#   the script keeps the files that were added there (virtual backgrounds,
+#   logos, custom CSS) and phase 2 puts them back.
 #
 #   Phase 2 on 24.04, after the reboot: Docker source for noble, a fresh
 #   PostgreSQL 16 cluster on port 5432 (BBB recreates its databases on every
@@ -64,6 +66,9 @@ DROPPED_CLIENT_SETTINGS='CUSTOM_LAYOUT|SMART_LAYOUT|PRESENTATION_FOCUS|VIDEO_FOC
 OBSOLETE_ORIGINS="Ubuntu,UbuntuESM,UbuntuESMApps,LP-PPA-rmescandon-yq,LP-PPA-bigbluebutton-support,LP-PPA-martin-uni-mainz-coturn"
 # Where uv puts the Python for the venv of bbb-livekit-stt; the service user must be able to read it
 UV_PYTHON_DIR="/usr/local/share/uv/python"
+# The HTML5 client and, below it, its virtual backgrounds
+CLIENT_DIR="/usr/share/bigbluebutton/html5-client"
+BACKGROUNDS_DIR="resources/images/virtual-backgrounds"
 
 CHECK_ONLY=0
 ASSUME_YES=0
@@ -397,6 +402,31 @@ PY
   say "backup: $STATE_DIR/backup-bbb30.tar.gz"
 }
 
+# The postrm of bbb-html5 deletes CLIENT_DIR as a whole, with everything that
+# was put there by hand or by Ansible: virtual backgrounds and their
+# thumbnails, logos, custom CSS. Keep the files the package does not own
+# (added/) and the virtual backgrounds of the package that were replaced by
+# other images (replaced/); phase 2 puts them back.
+step_save_client_files() {
+  local dest="$STATE_DIR/html5-client" kind f rel n=0
+  if ! pkg_installed bbb-html5 || [ ! -d "$CLIENT_DIR" ]; then
+    return 0
+  fi
+  while IFS=$'\t' read -r kind f; do
+    rel=${f#"$CLIENT_DIR/"}
+    mkdir -p "$dest/$kind/$(dirname "$rel")"
+    cp -a "$f" "$dest/$kind/$rel"
+    n=$((n + 1))
+  done < <(
+    LC_ALL=C comm -23 <(find "$CLIENT_DIR" \( -type f -o -type l \) | LC_ALL=C sort) <(dpkg -L bbb-html5 | LC_ALL=C sort) |
+      sed 's/^/added\t/'
+    # "??5?????? c <path>": the checksum differs from the one in the package
+    dpkg --verify bbb-html5 2>/dev/null |
+      awk -v dir="$CLIENT_DIR/$BACKGROUNDS_DIR/" '{path = substr($0, 13)} $1 ~ /^..5/ && index(path, dir) == 1 {print "replaced\t" path}'
+  )
+  say "kept $n file(s) of $CLIENT_DIR that are not from the package in $dest"
+}
+
 step_remove_bbb() {
   local pkgs=() purge=() keep=() p
   check_meetings
@@ -492,6 +522,7 @@ phase1() {
     exit 0
   fi
   run_step backup step_backup
+  run_step save-client-files step_save_client_files
   run_step remove-bbb step_remove_bbb
   run_step apt-sources step_apt_sources
   run_step prepare-release-upgrade step_prepare_release_upgrade
@@ -646,6 +677,62 @@ step_extra_packages() {
     say "installing the optional packages of the 3.0 install: ${missing[*]}"
     DEBIAN_FRONTEND=noninteractive apt-get -y install "${missing[@]}"
   fi
+}
+
+# Regular files by content, symbolic links by target.
+same_file() {
+  if [ -L "$1" ] || [ -L "$2" ]; then
+    [ -L "$1" ] && [ -L "$2" ] && [ "$(readlink "$1")" = "$(readlink "$2")" ]
+  else
+    cmp -s "$1" "$2"
+  fi
+}
+
+# Puts back what step_save_client_files kept. A file of 4.0 only gives way to
+# a replaced virtual background, never to a file that 3.0 did not have.
+step_restore_client_files() {
+  local src="$STATE_DIR/html5-client" kind f rel n=0
+  if [ ! -d "$src" ] || [ ! -d "$CLIENT_DIR" ]; then
+    return 0
+  fi
+  for kind in added replaced; do
+    while IFS= read -r f; do
+      rel=${f#"$src/$kind/"}
+      # there already, from an earlier run
+      if same_file "$f" "$CLIENT_DIR/$rel"; then
+        continue
+      fi
+      if [ "$kind" = added ] && { [ -e "$CLIENT_DIR/$rel" ] || [ -L "$CLIENT_DIR/$rel" ]; }; then
+        note "$CLIENT_DIR/$rel: 4.0 ships a file of this name, the one added on 3.0 is in $src/added"
+        continue
+      fi
+      mkdir -p "$(dirname "$CLIENT_DIR/$rel")"
+      cp -a "$f" "$CLIENT_DIR/$rel"
+      chown -h bigbluebutton:bigbluebutton "$CLIENT_DIR/$rel"
+      n=$((n + 1))
+    done < <(find "$src/$kind" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort)
+  done
+  if [ "$n" -gt 0 ]; then
+    say "put $n file(s) of the 3.0 install back into $CLIENT_DIR (virtual backgrounds and other local files)"
+  fi
+}
+
+# Virtual backgrounds that bbb-html5.yml lists and the client directory lacks.
+missing_backgrounds() {
+  local yml=/etc/bigbluebutton/bbb-html5.yml path name
+  if [ ! -s "$yml" ] || ! command -v yq-go >/dev/null 2>&1; then
+    return 0
+  fi
+  # storedOnBBB false: the images are loaded from another server
+  if [ "$(yq-go e '.public.virtualBackgrounds.storedOnBBB == false' "$yml" 2>/dev/null || true)" = true ]; then
+    return 0
+  fi
+  path=$(yq-go e ".public.virtualBackgrounds.imagesPath // \"/$BACKGROUNDS_DIR/\"" "$yml" 2>/dev/null) || return 0
+  while IFS= read -r name; do
+    if [ -n "$name" ] && [ ! -f "$CLIENT_DIR$path$name" ]; then
+      echo "$CLIENT_DIR$path$name"
+    fi
+  done < <(yq-go e '.public.virtualBackgrounds.fileNames[]' "$yml" 2>/dev/null)
 }
 
 step_config_cleanup() {
@@ -850,6 +937,11 @@ report() {
     say "settings that 4.0 removed (layouts, Etherpad, SIP.js, clientSettings):"
     indent <<<"$hits"
   fi
+  hits=$(missing_backgrounds)
+  if [ -n "$hits" ]; then
+    say "virtual backgrounds that bbb-html5.yml lists but the client lacks (removing bbb-html5 3.0 deleted its directory):"
+    indent <<<"$hits"
+  fi
   if [ -s "$STATE_DIR/notes.txt" ]; then
     say "problems the steps could not solve:"
     sort -u "$STATE_DIR/notes.txt" | indent
@@ -902,6 +994,7 @@ phase2() {
   run_step bbb-install step_bbb_install
   run_step coturn-unmask step_coturn_unmask
   run_step extra-packages step_extra_packages
+  run_step restore-client-files step_restore_client_files
   run_step config-cleanup step_config_cleanup
   run_step obsolete-packages step_obsolete_packages
   run_step bbbctl step_bbbctl
